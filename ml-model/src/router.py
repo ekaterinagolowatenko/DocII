@@ -1,74 +1,57 @@
-# ml-model/src/router.py
+import json, re, asyncio
 from langchain_core.prompts import PromptTemplate
-from .utils import parse_llm_json
 
-# 1. Промпт для определения намерения (интента)
-INTENT_PROMPT = PromptTemplate(
-    input_variables=["query"],
-    template="""
-    Ты - диспетчер задач AI-системы документооборота. 
-    Проанализируй запрос пользователя и верни ТОЛЬКО JSON в формате:
-    {"task": "qa | extract | classify | analytics | unknown", "original_query": "текст запроса"}
-    Запрос: {query}
-    """
+INTENT_PROMPT = PromptTemplate.from_template(
+    "Определи задачу: extract, qa, classify. Ответ только JSON: {{\"task\": \"...\"}}\nЗапрос: {query}"
 )
 
-# 2. Промпты для конкретных задач
-QA_PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template="Используй только контекст. Если ответа нет, скажи 'Нет данных'. Контекст: {context}\nВопрос: {question}\nОтвет:"
+QA_PROMPT = PromptTemplate.from_template(
+    "Используй только контекст. Если ответа нет, скажи 'Нет данных'.\nКонтекст: {context}\nВопрос: {question}"
 )
 
-EXTRACT_PROMPT = PromptTemplate(
-    input_variables=["context"],
-    template="Извлеки из текста: дата, контрагент, сумма, тип_расхода. Ответь ТОЛЬКО валидным JSON: {\"дата\": \"...\", \"контрагент\": \"...\", \"сумма\": \"...\", \"тип_расхода\": \"...\"}\nКонтекст: {context}"
+EXTRACT_PROMPT = PromptTemplate.from_template(
+    "Извлеки: дата, контрагент, сумма, тип_расхода. Только JSON.\nКонтекст: {context}"
 )
 
-CLASSIFY_PROMPT = PromptTemplate(
-    input_variables=["context", "categories"],
-    template="Выбери ОДНУ категорию из списка {categories} или 'Другое'. Контекст: {context}\nОтвет (только название):"
-)
+def _safe_parse_json(text: str) -> dict:
+    try:
+        cleaned = re.sub(r'`(?:json)?\s*|\s*```', '', text).strip()
+        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        return json.loads(match.group()) if match else {}
+    except json.JSONDecodeError:
+        return {}
 
-def route_and_execute(query: str, llm, vector_db) -> dict:
-    """Единая точка входа. Читает запрос, понимает задачу, возвращает результат."""
-    
-    # 1. Определяем интент
-    intent_chain = INTENT_PROMPT | llm
-    intent_raw = intent_chain.invoke({"query": query})
-    intent = parse_llm_json(intent_raw.content)
+async def route_and_execute_async(query: str, llm, vector_db) -> dict:
+    # 1. Определяем интент (async)
+    intent_text = await (INTENT_PROMPT | llm).ainvoke({"query": query})
+    intent = _safe_parse_json(intent_text.content)
     task = intent.get("task", "unknown")
-    
+
     retriever = vector_db.as_retriever(search_kwargs={"k": 3})
-    
+
     # 2. Выполняем задачу
-    if task == "qa":
-        docs = retriever.invoke(query)
+    if task == "extract":
+        docs = await retriever.ainvoke(query)
         context = "\n---\n".join([d.page_content for d in docs])
-        result = (QA_PROMPT | llm).invoke({"context": context, "question": query})
-        return {"task": "qa", "answer": result.content}
-        
-    elif task == "extract":
-        docs = retriever.invoke("дата сумма контрагент договор счет акт")
+        result = await (EXTRACT_PROMPT | llm).ainvoke({"context": context})
+        return {"task": "extract", "status": "success", "data": _safe_parse_json(result.content), "message": None}
+
+    elif task == "qa":
+        docs = await retriever.ainvoke(query)
         context = "\n---\n".join([d.page_content for d in docs])
-        result = (EXTRACT_PROMPT | llm).invoke({"context": context})
-        return {"task": "extract", "data": parse_llm_json(result.content)}
-        
+        result = await (QA_PROMPT | llm).ainvoke({"context": context, "question": query})
+        return {"task": "qa", "status": "success", "data": {"answer": result.content}, "message": None}
+
     elif task == "classify":
-        docs = retriever.invoke(query)
+        docs = await retriever.ainvoke(query)
         context = "\n---\n".join([d.page_content for d in docs])
-        # Можно захардкодить категории или брать из запроса
-        categories = "Договор, Счет, Акт, Накладная, Другое"
-        result = (CLASSIFY_PROMPT | llm).invoke({"context": context, "categories": categories})
-        return {"task": "classify", "category": result.content.strip()}
-        
-    elif task == "analytics":
-        # Для аналитики возвращаем сырой текст + просим LLM сгенерировать pandas-код
-        # (в проде лучше использовать безопасный eval или pre-defined templates)
-        return {"task": "analytics", "note": "Аналитика требует передачи таблицы. Передайте данные явно."}
-        
+        cat_prompt = PromptTemplate.from_template("Выбери 1 категорию из: Договор, Счет, Акт, Другое.\nКонтекст: {context}")
+        result = await (cat_prompt | llm).ainvoke({"context": context})
+        return {"task": "classify", "status": "success", "data": {"category": result.content.strip()}, "message": None}
+
     else:
-        # Fallback: обычный QA по всем документам
-        docs = retriever.invoke(query)
+        # Fallback: обычный QA
+        docs = await retriever.ainvoke(query)
         context = "\n---\n".join([d.page_content for d in docs])
-        result = (QA_PROMPT | llm).invoke({"context": context, "question": query})
-        return {"task": "fallback_qa", "answer": result.content}
+        result = await (QA_PROMPT | llm).ainvoke({"context": context, "question": query})
+        return {"task": "fallback", "status": "success", "data": {"answer": result.content}, "message": None}

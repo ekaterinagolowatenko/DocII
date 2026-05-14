@@ -1,12 +1,10 @@
-import os
-import pdfplumber
-import pytesseract
+import os, asyncio, pdfplumber, pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
 
 VALID_EXTS = ('.pdf', '.jpg', '.jpeg', '.png', '.tiff')
 
-def scan_files(root_dir):
+def scan_files(root_dir: str) -> list[str]:
     paths = []
     for root, _, files in os.walk(root_dir):
         for f in files:
@@ -14,7 +12,7 @@ def scan_files(root_dir):
                 paths.append(os.path.join(root, f))
     return paths
 
-def extract_text(file_path: str) -> str:
+def _extract_text_sync(file_path: str) -> str:
     ext = file_path.lower().split('.')[-1]
     text = ""
     if ext == 'pdf':
@@ -26,3 +24,9 @@ def extract_text(file_path: str) -> str:
     else:
         text = pytesseract.image_to_string(Image.open(file_path), lang='rus+eng')
     return text.strip()
+
+async def extract_text_async_batch(file_paths: list[str]) -> list[str]:
+    # Запускаем блокирующий OCR/PDF в пуле потоков, не блокируя event loop
+    loop = asyncio.get_running_loop()
+    tasks = [loop.run_in_executor(None, _extract_text_sync, fp) for fp in file_paths]
+    return await asyncio.gather(*tasks)
